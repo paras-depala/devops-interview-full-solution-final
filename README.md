@@ -253,9 +253,6 @@ request can take a few seconds while the Lambda starts and the app creates the t
 
 ## Cleaning up
 
-Left running, it costs about $3 a day, mostly the SQL Server instance ($0.096 an hour in
-eu-west-2) and the Secrets Manager endpoint.
-
 To remove the infra, run the Destroy workflow, or `terraform destroy` in `infra` if you applied
 it locally. The database is deleted without a final snapshot. It takes a while, as RDS and the
 Lambda's network interfaces are slow to delete.
