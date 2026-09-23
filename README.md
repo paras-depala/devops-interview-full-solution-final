@@ -210,8 +210,8 @@ Do steps 1 and 3 to 6 above. `github_repository` still needs a value, but any `o
 do as the roles won't get used. Step 7 is optional, bootstrap's state can stay local.
 
 `infra` can't be applied on its own, it needs the state bucket and the permissions boundary from
-bootstrap. Terraform also zips `app/` exactly as it is, so the production dependencies have to be
-installed first. If they're missing the apply still works, but every request returns a 500.
+bootstrap. Terraform also zips `app/` exactly as it is, so the dependencies have to be
+installed before zip (not a problem in pipeline). If they're missing the apply still works, but every request returns a 500.
 
 Still in `bootstrap`:
 
