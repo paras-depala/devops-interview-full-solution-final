@@ -201,6 +201,101 @@ Bootstrap's state is in S3 from step 7 onwards, so on any other machine, initial
 terraform init -backend-config="bucket=<tf_state_bucket>" -backend-config="region=<aws_region>"
 ```
 
+## Trying it without GitHub
+
+If you just want to check the templates work, you can apply everything from your own machine
+with admin credentials and skip the pipeline.
+
+Do steps 1 and 3 to 6 above. `github_repository` still needs a value, but any `owner/name` will
+do as the roles won't get used. Step 7 is optional, bootstrap's state can stay local.
+
+`infra` can't be applied on its own, it needs the state bucket and the permissions boundary from
+bootstrap. Terraform also zips `app/` exactly as it is, so the production dependencies have to be
+installed first. If they're missing the apply still works, but every request returns a 500.
+
+Still in `bootstrap`:
+
+```bash
+bucket=$(terraform output -raw tf_state_bucket)
+export AWS_REGION=$(terraform output -raw aws_region)
+export TF_VAR_aws_region=$AWS_REGION
+cd ../app
+npm ci --omit=dev
+cd ../infra
+terraform init -backend-config="bucket=$bucket" -backend-config="region=$AWS_REGION"
+terraform apply
+```
+
+The first apply points the `live` alias at the function. After that Terraform leaves the alias
+alone because the pipeline moves it, so a code change applied locally publishes a new version
+but doesn't switch to it. To switch by hand:
+
+```bash
+aws lambda update-alias --function-name "$(terraform output -raw lambda_function_name)" \
+  --name live --function-version "$(terraform output -raw lambda_version)"
+```
+
+## Calling the API
+
+The URL is the `api_endpoint` output. It's printed at the end of the deploy job's apply step, or
+run `terraform output -raw api_endpoint` in `infra`.
+
+```bash
+api=<api_endpoint>
+curl "$api/health"
+curl "$api/users" -H "Content-Type: application/json" \
+  -d '{"firstname":"Jane","surname":"Doe","weight":62.5,"height":170}'
+curl "$api/users/<id from the previous response>"
+```
+
+`firstname`, `surname` and `weight` (kg) are required, `height` (cm) is optional. The first
+request can take a few seconds while the Lambda starts and the app creates the table.
+
+## Cleaning up
+
+Left running, it costs about $3 a day, mostly the SQL Server instance ($0.096 an hour in
+eu-west-2) and the Secrets Manager endpoint.
+
+To remove the infra, run the Destroy workflow, or `terraform destroy` in `infra` if you applied
+it locally. The database is deleted without a final snapshot. It takes a while, as RDS and the
+Lambda's network interfaces are slow to delete.
+
+Bootstrap takes a bit more, because the state bucket is protected from deletion and, if you did
+step 7, bootstrap's own state is inside it. First bring the state back to local, from the machine
+you set bootstrap up on (skip this if you never moved it):
+
+```bash
+cd bootstrap
+rm backend.tf
+terraform init -migrate-state -force-copy
+```
+
+Then in `bootstrap/main.tf`, remove the `lifecycle` block from `aws_s3_bucket.state` and add
+`force_destroy = true`, so Terraform can empty the bucket, old versions included. If you imported
+an existing OIDC provider in step 5 and want to keep it, run
+`terraform state rm aws_iam_openid_connect_provider.github` first. Then:
+
+```bash
+terraform apply -var "github_repository=<repo id>"
+terraform destroy -var "github_repository=<repo id>"
+```
+
+## Extending it
+
+The modules take variables for the things you'd most likely want to change, so most changes are
+a case of passing them in from `infra/main.tf`:
+
+- Database - `sql-server` takes `engine`, `engine_version`, `instance_class`, `allocated_storage`,
+  `multi_az`, `backup_retention_days` and `deletion_protection`. Only the instance size is a root
+  variable (`database_instance_class`) at the moment. Standard edition needs
+  `engine = "sqlserver-se"` and at least `db.t3.xlarge`, which also allows `multi_az = true`.
+- API - `lambda-api` takes `memory_size`, `timeout` and the throttling limits. New routes go in
+  `app/src/app.js` and their queries alongside the ones in `users.js`. A new table would also need
+  creating in `database.js`, next to `Users`. They deploy through the pipeline like any other
+  code change.
+- Another function - add another `lambda-api` module block pointing at its own folder. The
+  pipeline would need to install that folder's dependencies too.
+
 ## Running the tests locally
 
 ```bash
