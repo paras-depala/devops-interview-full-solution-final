@@ -1,0 +1,66 @@
+name: Destroy
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type "destroy" to delete the deployed infrastructure
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  TERRAFORM_VERSION: "1.14.9"
+
+jobs:
+  destroy:
+    name: Destroy
+    runs-on: ubuntu-latest
+    concurrency:
+      group: terraform-infra
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: infra
+    env:
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "false"
+      TF_VAR_aws_region: ${{ vars.AWS_REGION }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check confirmation
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if [[ "$CONFIRM" != "destroy" ]]; then
+            echo "::error::Nothing was destroyed. Type destroy in the confirmation box to proceed."
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::Run this workflow from main. Only main can assume the deploy role."
+            exit 1
+          fi
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Terraform init
+        env:
+          STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+        run: terraform init -backend-config="bucket=$STATE_BUCKET" -backend-config="region=$TF_VAR_aws_region"
+
+      - name: Terraform destroy
+        run: terraform destroy -auto-approve

@@ -1,0 +1,263 @@
+name: CI/CD
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  NODE_VERSION: "22"
+  TERRAFORM_VERSION: "1.14.9"
+
+jobs:
+  test-app:
+    name: Test app
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    services:
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_SA_PASSWORD: CiOnly-Passw0rd
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P CiOnly-Passw0rd -Q 'SELECT 1' -b"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      DB_HOST: localhost
+      DB_USER: sa
+      DB_PASSWORD: CiOnly-Passw0rd
+      DB_TRUST_SERVER_CERTIFICATE: "true"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - run: npm ci
+      - run: npm test
+
+  check-terraform:
+    name: Check Terraform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+      - run: terraform fmt -check -recursive
+      - name: Validate bootstrap
+        working-directory: bootstrap
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+      - name: Validate and test infra
+        working-directory: infra
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+          terraform test
+      - uses: terraform-linters/setup-tflint@v6
+        with:
+          tflint_version: v0.64.0
+      - name: Lint Terraform
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          tflint --init
+          tflint --recursive --config="$GITHUB_WORKSPACE/.tflint.hcl"
+
+  plan:
+    name: Plan
+    needs: check-terraform
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: infra
+    env:
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "false"
+      TF_VAR_aws_region: ${{ vars.AWS_REGION }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - name: Install production dependencies
+        working-directory: app
+        run: npm ci --omit=dev
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Terraform init
+        env:
+          STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+        run: terraform init -backend-config="bucket=$STATE_BUCKET" -backend-config="region=$TF_VAR_aws_region"
+
+      - name: Terraform plan
+        run: |
+          terraform plan -lock=false -no-color -out=tfplan
+          {
+            echo "### Terraform plan"
+            echo '```'
+            terraform show -no-color tfplan
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  dependency-review:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/dependency-review-action@v5
+        with:
+          fail-on-severity: high
+
+  deploy:
+    name: Deploy
+    needs: [test-app, check-terraform]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: terraform-infra
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: infra
+    env:
+      TF_IN_AUTOMATION: "true"
+      TF_INPUT: "false"
+      TF_VAR_aws_region: ${{ vars.AWS_REGION }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - name: Install production dependencies
+        working-directory: app
+        run: npm ci --omit=dev
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Terraform init
+        env:
+          STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+        run: terraform init -backend-config="bucket=$STATE_BUCKET" -backend-config="region=$TF_VAR_aws_region"
+
+      - name: Record the live Lambda version
+        id: live
+        run: |
+          outputs=$(terraform output -json)
+          function=$(jq -r '.lambda_function_name.value // empty' <<< "$outputs")
+          alias=$(jq -r '.lambda_alias_name.value // empty' <<< "$outputs")
+          published=$(jq -r '.lambda_version.value // empty' <<< "$outputs")
+          echo "published=$published" >> "$GITHUB_OUTPUT"
+          if [[ -n "$function" && -n "$alias" ]]; then
+            version=$(aws lambda get-alias --function-name "$function" --name "$alias" --query FunctionVersion --output text)
+            {
+              echo "function=$function"
+              echo "alias=$alias"
+              echo "version=$version"
+            } >> "$GITHUB_OUTPUT"
+            echo "Live version before this deploy: $version"
+          else
+            echo "No live alias recorded yet, so there's nothing to roll back to."
+          fi
+
+      - name: Terraform plan
+        run: terraform plan -lock-timeout=5m -out=tfplan
+
+      - name: Terraform apply
+        run: terraform apply -lock-timeout=5m tfplan
+
+      - name: Promote the new Lambda version
+        id: promote
+        env:
+          PREVIOUS: ${{ steps.live.outputs.published }}
+        run: |
+          outputs=$(terraform output -json)
+          function=$(jq -r '.lambda_function_name.value' <<< "$outputs")
+          alias=$(jq -r '.lambda_alias_name.value' <<< "$outputs")
+          published=$(jq -r '.lambda_version.value' <<< "$outputs")
+          if [[ "$published" == "$PREVIOUS" ]]; then
+            echo "No new Lambda version in this deploy, so $alias stays where it is."
+          else
+            live=$(aws lambda update-alias --function-name "$function" --name "$alias" --function-version "$published" --query FunctionVersion --output text)
+            echo "promoted=true" >> "$GITHUB_OUTPUT"
+            echo "$alias now points at version $live."
+          fi
+
+      - name: Smoke test
+        id: smoke
+        run: |
+          api=$(terraform output -raw api_endpoint)
+          curl --fail --silent --show-error --retry 5 --retry-all-errors "$api/health"
+          user=$(curl --fail-with-body --silent --show-error --retry 3 --retry-all-errors \
+            --header "Content-Type: application/json" \
+            --data '{"firstname":"Smoke","surname":"Test","weight":70.5}' \
+            "$api/users")
+          id=$(jq --exit-status --raw-output .id <<< "$user")
+          curl --fail-with-body --silent --show-error "$api/users/$id" \
+            | jq --exit-status --arg id "$id" '.id == $id and .firstname == "Smoke" and .weight == 70.5'
+
+      - name: Roll back the Lambda
+        if: >-
+          failure() &&
+          steps.smoke.outcome == 'failure' &&
+          steps.promote.outputs.promoted == 'true' &&
+          steps.live.outputs.version != ''
+        env:
+          FUNCTION: ${{ steps.live.outputs.function }}
+          ALIAS: ${{ steps.live.outputs.alias }}
+          VERSION: ${{ steps.live.outputs.version }}
+        run: |
+          restored=$(aws lambda update-alias --function-name "$FUNCTION" --name "$ALIAS" --function-version "$VERSION" --query FunctionVersion --output text)
+          echo "::error::Deploy failed, so $ALIAS was pointed back at version $restored. Fix forward or revert the commit."

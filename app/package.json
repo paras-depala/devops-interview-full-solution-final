@@ -1,0 +1,19 @@
+{
+  "name": "node-web-api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@aws-sdk/client-secrets-manager": "^3.1137.0",
+    "express": "^5.2.1",
+    "mssql": "^12.7.2",
+    "serverless-http": "^4.0.0"
+  }
+}
